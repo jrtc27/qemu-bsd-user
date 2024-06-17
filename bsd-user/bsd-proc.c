@@ -21,8 +21,14 @@
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/cpuset.h>
+#include <sys/queue.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/sysctl.h>
+#include <sys/user.h>
 #include <sys/wait.h>
+
+#include <libprocstat.h>
 
 #include "qemu.h"
 #include "qemu-bsd.h"
@@ -143,3 +149,55 @@ int bsd_get_ncpu(void)
     return ncpu;
 }
 
+struct mapped_range *bsd_get_mapped_ranges(unsigned int *countp)
+{
+    struct procstat *psp = NULL;
+    struct kinfo_proc *kipp = NULL;
+    struct kinfo_vmentry *kivp = NULL;
+    struct mapped_range *ranges = NULL;
+    unsigned int count;
+
+    psp = procstat_open_sysctl();
+    if (psp == NULL) {
+        perror("procstat_open_sysctl");
+        goto done;
+    }
+    kipp = procstat_getprocs(psp, KERN_PROC_PID, getpid(), &count);
+    if (kipp == NULL) {
+        perror("procstat_getprocs");
+        goto done;
+    }
+    if (count != 1) {
+        fprintf(stderr, "procstat_getprocs gave unexpected count: %u\n",
+                count);
+        goto done;
+    }
+    kivp = procstat_getvmmap(psp, kipp, &count);
+    if (kivp == NULL) {
+        perror("procstat_getvmmap");
+        goto done;
+    }
+    if (count == 0) {
+        fprintf(stderr, "procstat_getvmmap found no mappings\n");
+        goto done;
+    }
+
+    ranges = g_new(struct mapped_range, count);
+    for (unsigned int i = 0; i < count; ++i) {
+        ranges[i].start = kivp[i].kve_start;
+        ranges[i].end = kivp[i].kve_end;
+    }
+    *countp = count;
+
+done:
+    if (kivp != NULL) {
+        procstat_freevmmap(psp, kivp);
+    }
+    if (kipp != NULL) {
+        procstat_freeprocs(psp, kipp);
+    }
+    if (psp != NULL) {
+        procstat_close(psp);
+    }
+    return ranges;
+}

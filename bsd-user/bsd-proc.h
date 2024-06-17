@@ -26,8 +26,14 @@
 #include "gdbstub/syscalls.h"
 #include "qemu/plugin.h"
 
+struct mapped_range {
+    uintptr_t start;
+    uintptr_t end;
+};
+
 extern int _getlogin(char*, int);
 int bsd_get_ncpu(void);
+struct mapped_range *bsd_get_mapped_ranges(unsigned int *countp);
 
 /* exit(2) */
 static inline abi_long do_bsd_exit(void *cpu_env, abi_long arg1)

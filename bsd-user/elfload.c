@@ -37,6 +37,8 @@ abi_ulong target_stkbas;
 static int elf_core_dump(int signr, CPUArchState *env);
 static int load_elf_sections(const struct elfhdr *hdr, struct elf_phdr *phdr,
     int fd, abi_ulong rbase, abi_ulong *baddrp);
+static void probe_guest_base(const char *filename, target_ulong start,
+    target_ulong length);
 
 static inline void memcpy_fromfs(void *to, const void *from, unsigned long n)
 {
@@ -603,14 +605,14 @@ int load_elf_binary(struct bsd_binprm *bprm, struct target_pt_regs *regs,
     struct elfhdr elf_ex;
     struct elfhdr interp_elf_ex;
     int interpreter_fd = -1; /* avoid warning */
-    abi_ulong load_addr;
+    abi_ulong load_addr, loaddr, hiaddr;
     int i;
     struct elf_phdr *elf_ppnt;
     struct elf_phdr *elf_phdata;
     abi_ulong elf_brk;
     int error, retval;
     char *elf_interpreter;
-    abi_ulong baddr, elf_entry, et_dyn_addr, interp_load_addr = 0;
+    abi_ulong elf_entry, et_dyn_addr, interp_load_addr = 0;
     abi_ulong reloc_func_desc = 0;
 
     load_addr = 0;
@@ -654,10 +656,19 @@ int load_elf_binary(struct bsd_binprm *bprm, struct target_pt_regs *regs,
 
     elf_brk = 0;
 
-
+    loaddr = -1, hiaddr = 0;
     elf_interpreter = NULL;
     for (i = 0; i < elf_ex.e_phnum; i++) {
-        if (elf_ppnt->p_type == PT_INTERP) {
+        if (elf_ppnt->p_type == PT_LOAD) {
+            abi_ulong a = elf_ppnt->p_vaddr & TARGET_PAGE_MASK;
+            if (a < loaddr) {
+                loaddr = a;
+            }
+            a = elf_ppnt->p_vaddr + elf_ppnt->p_memsz - 1;
+            if (a > hiaddr) {
+                hiaddr = a;
+            }
+        } else if (elf_ppnt->p_type == PT_INTERP) {
             if (elf_interpreter != NULL) {
                 free(elf_phdata);
                 free(elf_interpreter);
@@ -713,6 +724,14 @@ int load_elf_binary(struct bsd_binprm *bprm, struct target_pt_regs *regs,
         elf_ppnt++;
     }
 
+    et_dyn_addr = 0;
+    if (elf_ex.e_type == ET_DYN && loaddr == 0) {
+        et_dyn_addr = ELF_ET_DYN_LOAD_ADDR;
+    }
+
+    /* Use guest_base if the load range overlaps any of our mappings */
+    probe_guest_base(bprm->filename, et_dyn_addr + loaddr, hiaddr - loaddr + 1);
+
     /* Some simple consistency checks for the interpreter */
     if (elf_interpreter) {
         if (interp_elf_ex.e_ident[0] != 0x7f ||
@@ -739,21 +758,6 @@ int load_elf_binary(struct bsd_binprm *bprm, struct target_pt_regs *regs,
     info->end_data = 0;
     info->end_code = 0;
     elf_entry = (abi_ulong) elf_ex.e_entry;
-
-    /* XXX Join this with PT_INTERP search? */
-    baddr = 0;
-    for (i = 0, elf_ppnt = elf_phdata; i < elf_ex.e_phnum; i++, elf_ppnt++) {
-        if (elf_ppnt->p_type != PT_LOAD) {
-            continue;
-        }
-        baddr = elf_ppnt->p_vaddr;
-        break;
-    }
-
-    et_dyn_addr = 0;
-    if (elf_ex.e_type == ET_DYN && baddr == 0) {
-        et_dyn_addr = ELF_ET_DYN_LOAD_ADDR;
-    }
 
     /*
      * Do this so that we can load the interpreter, if need be.  We will
@@ -824,6 +828,67 @@ int load_elf_binary(struct bsd_binprm *bprm, struct target_pt_regs *regs,
 #endif
 
     return 0;
+}
+
+static void probe_guest_base(const char *filename, target_ulong start,
+                             target_ulong length)
+{
+    struct mapped_range *ranges;
+    unsigned int count;
+    bool overlap;
+    uintptr_t prev, found, host_start, host_end;
+
+    ranges = bsd_get_mapped_ranges(&count);
+    if (ranges == NULL) {
+        fprintf(stderr, "failed to find current mapped ranges\n");
+        exit(-1);
+    }
+
+    prev = qemu_real_host_page_size();
+    overlap = false;
+    found = 0;
+    host_start = guest_base + start;
+    host_end = host_start + length;
+    for (unsigned int i = 0; i < count; i++) {
+        if (found == 0) {
+            uintptr_t clamp_prev;
+
+            assert(ranges[i].start >= prev);
+            clamp_prev = MAX(start, prev);
+            if (ranges[i].start >= clamp_prev
+                && ranges[i].start - clamp_prev >= length)
+                found = clamp_prev;
+        }
+
+        /* Don't treat reserved_va regions as overlapping */
+        if (reserved_va == 0 || ranges[i].start < guest_base
+            || ranges[i].end - guest_base >
+               QEMU_ALIGN_UP(reserved_va, qemu_real_host_page_size())) {
+            if (host_end > ranges[i].start && ranges[i].end > host_start) {
+                overlap = true;
+            }
+        }
+
+        prev = ranges[i].end;
+    }
+
+    if (overlap) {
+        if (have_guest_base) {
+            error_report("%s: requires virtual address space that is in use "
+                         "(omit the -B option or choose a different value)",
+                         filename);
+            exit(-1);
+        }
+
+        if (found == 0) {
+            found = MAX(start, prev);
+        }
+
+        have_guest_base = true;
+        guest_base = found - start;
+    }
+
+    g_free(ranges);
 }
 
 void do_init_thread(struct target_pt_regs *regs, struct image_info *infop)
